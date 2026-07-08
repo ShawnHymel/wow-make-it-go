@@ -59,8 +59,24 @@ public:
     return _last;
   }
 
+  // Sentinel returned by the register reads on an I2C failure (NAK / no
+  // sensor). Proximity data never legitimately reaches 0xFFFF with these
+  // settings, so it doubles as an "is this reading trustworthy" flag.
+  static constexpr uint16_t READ_ERROR = 0xFFFF;
+
   // The most recent value read by readProximity() or checkTrigger().
   uint16_t last() const { return _last; }
+
+  // True if the last read succeeded. A loose Qwiic cable or dead sensor
+  // makes read16() return READ_ERROR; callers use this to surface an
+  // error instead of acting on garbage.
+  bool ok() const { return _last != READ_ERROR; }
+
+  // Current debounced presence state: true while an object is over the
+  // sensor, false once it has pulled back past the re-arm threshold.
+  // Lets callers detect the *falling* edge (object leaving) as well as
+  // the rising edge that checkTrigger() returns.
+  bool covered() const { return _covered; }
 
   // Rising-edge trigger with hysteresis. Reads the sensor once (updating
   // last()) and returns true exactly once each time proximity crosses
@@ -68,8 +84,13 @@ public:
   // (threshold - hysteresis), so a hovering hand won't machine-gun
   // triggers. This replaces the external covered1/covered2 bookkeeping --
   // each sensor now tracks its own state.
+  //
+  // A failed read (READ_ERROR) is never treated as a trigger and leaves
+  // the covered state untouched -- otherwise 0xFFFF would read as "way
+  // above threshold" and fire a phantom trigger. Check ok() to detect it.
   bool checkTrigger(uint16_t threshold, uint16_t hysteresis = 50) {
     uint16_t val = readProximity();
+    if (val == READ_ERROR) return false;   // bad read -> hold state, no trigger
     uint16_t rearm = (hysteresis < threshold) ? (threshold - hysteresis) : 0;
 
     if (!_covered && val > threshold) {
