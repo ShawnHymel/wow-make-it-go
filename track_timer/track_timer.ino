@@ -26,6 +26,11 @@ const unsigned long FINISH_FLASH_MS   = 300UL;
 // Consecutive read failures before a hard reboot.
 const uint8_t ERROR_REBOOT_LIMIT = 10;
 
+// Watchdog timeout. A normal loop() pass is a few milliseconds -- two sensor
+// reads and at most one SPI write -- so a second leaves enormous headroom
+// while still recovering faster than a spectator can register the freeze.
+const uint8_t WDT_TIMEOUT = WDTO_1S;
+
 //*****************************************************************************
 // Globals
 
@@ -144,6 +149,16 @@ void reportTrigger(uint8_t lane, uint16_t reading) {
 
 void setup() {
 
+  // Disarm the watchdog before anything else. Coming out of a watchdog reset
+  // the WDT is still armed at the timeout that fired it, and WDRF must be
+  // cleared before WDE can be -- clearing WDE alone is a silent no-op.
+  // Optiboot already does this before handing us control (which is why the
+  // existing hardReboot() recovers instead of bricking the board); this is
+  // belt-and-braces, and it will NOT rescue a stock bootloader -- that one
+  // gets reset inside its own startup delay, long before setup() runs.
+  MCUSR &= ~_BV(WDRF);
+  wdt_disable();
+
   // Pour a bowl of serial
   Serial.begin(115200);
   Serial.println(F("Booting..."));
@@ -179,6 +194,11 @@ void setup() {
 
   // Timer starts at 0.0, waiting for an object on the gate.
   showTenths(0);
+
+  // Arm the watchdog last. Everything above blocks for well over two seconds
+  // (two settle delays plus AMBIENT_SAMPLES * 50 ms of calibration), so any
+  // timeout short enough to be useful in loop() would reset us mid-setup.
+  wdt_enable(WDT_TIMEOUT);
 }
 
 void loop() {
@@ -189,6 +209,11 @@ void loop() {
   static uint8_t       flashesLeft  = 0;   // remaining finish blinks
   static bool          flashOn      = false;
   static bool          prevCovered1 = false;
+
+  // Feed the dog at the TOP of loop(), not the bottom: the error branch below
+  // returns early, and a feed at the bottom would be skipped on every failed
+  // read -- handing the watchdog a reboot that ERROR_REBOOT_LIMIT already owns.
+  wdt_reset();
 
   // Poll both sensors once per pass. checkTrigger() also refreshes each
   // sensor's ok()/covered() state.
