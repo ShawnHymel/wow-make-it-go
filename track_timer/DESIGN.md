@@ -29,7 +29,21 @@ no `delay()`, no blocking.
 - Timeout (99.9 s) just freezes at the ceiling and returns to `READY`; it is
   not treated as an error.
 
-## Driver support (`SoftVCNL4040.h`)
+## Bus layout
+
+Both VCNL4040s answer to I2C address `0x60`, so they can't share a bus.
+Each sensor gets its own:
+
+- **Sensor 1 (start gate)** — bit-banged software I2C (`SoftVCNL4040`) on
+  SDA pin 2 / SCL pin 5.
+- **Sensor 2 (finish line)** — hardware I2C (`HardVCNL4040`, the `Wire`
+  library) on the ATmega's fixed TWI pins A4 (SDA) / A5 (SCL).
+
+Both drivers expose the same API (`begin`/`checkTrigger`/`ok`/`covered`/
+`last`), so the state machine treats the two sensors identically. See
+`sensors_test_hwi2c` for the standalone two-sensor diagnostic.
+
+## Driver support (`SoftVCNL4040.h` / `HardVCNL4040.h`)
 
 Three small additions so the sketch can see gate edges and read failures:
 

@@ -1,8 +1,10 @@
 // Arduino libraries
 #include <SPI.h>
+#include <avr/wdt.h>
 
 // Custom
 #include "SoftVCNL4040.h"
+#include "HardVCNL4040.h"
 #include "Serial7Seg.h"
 
 //*****************************************************************************
@@ -22,11 +24,12 @@ const unsigned long FLASH_INTERVAL_MS = 400UL;
 //*****************************************************************************
 // Globals
 
-// Two sensors sharing one SCL line, each with its own SDA pin. They all
-// live at I2C address 0x60, so giving each its own SDA line is how we
-// address them independently.
-SoftVCNL4040 prox1(2, 5);  // SDA 2, shared SCL 5 -- start gate
-SoftVCNL4040 prox2(4, 5);  // SDA 4, shared SCL 5 -- finish line
+// Both VCNL4040s answer to I2C address 0x60, so they can't share a bus.
+// We split them across two buses instead: the start gate is bit-banged on
+// its own SDA/SCL pins, and the finish line owns the ATmega's dedicated
+// hardware-I2C pins (A4 = SDA, A5 = SCL). One sensor per bus, no clash.
+SoftVCNL4040 prox1(2, 5);  // bit-banged SDA 2 / SCL 5 -- start gate
+HardVCNL4040 prox2;         // hardware I2C on A4/A5    -- finish line
 
 // 7-segment LED display
 Serial7Seg display(DISPLAY_SS_PIN);
@@ -88,6 +91,16 @@ void showText(const char* s) {
 //*****************************************************************************
 // Functions
 
+// Force a full hardware reset. Arming the watchdog for its shortest timeout
+// and spinning lets it fire, which resets the whole MCU (registers,
+// peripherals and all) -- unlike a jump-to-zero soft reset. Give the serial
+// line a moment to flush the message first.
+void hardReboot() {
+  Serial.flush();
+  wdt_enable(WDTO_15MS);
+  while (1) { }
+}
+
 void reportTrigger(uint8_t lane, uint16_t reading) {
   Serial.print(F("TRIGGER lane "));
   Serial.print(lane);
@@ -112,17 +125,20 @@ void setup() {
   display.clear();
   display.setBrightness(DISPLAY_BRIGHTNESS);
 
-  // Initialize proximity sensors
+  // Initialize start proximity sensor
+  delay(1000);
   bool ok1 = prox1.begin();
-  bool ok2 = prox2.begin();
   if (!ok1) {
     Serial.println(F("Sensor 1 not found"));
+    hardReboot();
   }
+
+  // Initialize finish proximity sensor
+  delay(1000);
+  bool ok2 = prox2.begin();
   if (!ok2) {
     Serial.println(F("Sensor 2 not found"));
-  }
-  if (!ok1 || !ok2) {
-    while(1);
+    hardReboot();
   }
   Serial.println(F("Both sensors armed"));
 
@@ -143,10 +159,15 @@ void loop() {
   bool rise2 = prox2.checkTrigger(TRIGGER_THRESHOLD);   // object hit finish line
 
   // A bad read trumps everything: surface it and hold until it recovers.
-  if (!prox1.ok() || !prox2.ok()) {
-    showText(!prox1.ok() ? "Err1" : "Err2");
+  if (!prox1.ok()) {
+    showText("Err1");
+    Serial.println("Error: sensor 1");
     state = ERROR;
-    return;
+  }
+  if (!prox2.ok()) {
+    showText("Err2");
+    Serial.println("Error: sensor 2");
+    state = ERROR;
   }
   if (state == ERROR) {              // reads recovered -> clean slate at 0.0
     state = READY;
@@ -195,7 +216,7 @@ void loop() {
       if (rise2 || timedOut) {
         if (rise2) reportTrigger(2, prox2.last());
         Serial.print(timedOut ? F("TIMEOUT @ ") : F("FINISH @ "));
-        Serial.print(elapsed / 100.0, 1);
+        Serial.print(elapsed / 1000.0, 1);
         Serial.println(F(" s"));
         state = READY;   // freeze: the final time stays on the display
       }
