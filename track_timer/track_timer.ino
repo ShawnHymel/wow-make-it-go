@@ -161,35 +161,37 @@ void setup() {
 
   // Pour a bowl of serial
   Serial.begin(115200);
-  Serial.println(F("Booting..."));
 
   // Initialize the display
+  Serial.println(F("Initializing display..."));
   display.begin();
   display.clear();
   display.setBrightness(DISPLAY_BRIGHTNESS);
 
   // Initialize start proximity sensor
+  Serial.println(F("Initializing proximity sensor 1..."));
   delay(1000);
   bool ok1 = prox1.begin();
   if (!ok1) {
     Serial.println(F("Error: Sensor 1 not found"));
-    display.print("Err1");
+    showText("Err1");
     delay(1000);
     hardReboot();
   }
 
   // Initialize finish proximity sensor
+  Serial.println(F("Initializing proximity sensor 2..."));
   delay(1000);
   bool ok2 = prox2.begin();
   if (!ok2) {
     Serial.println(F("Error: Sensor 2 not found"));
-    display.print("Err2");
+    showText("Err2");
     delay(1000);
     hardReboot();
   }
-  Serial.println(F("Both sensors armed"));
 
   // Capture ambient proximity baselines before anything is on the track.
+  Serial.println(F("Both sensors armed. Calibrating..."));
   calibrateAmbient();
 
   // Timer starts at 0.0, waiting for an object on the gate.
@@ -198,7 +200,11 @@ void setup() {
   // Arm the watchdog last. Everything above blocks for well over two seconds
   // (two settle delays plus AMBIENT_SAMPLES * 50 ms of calibration), so any
   // timeout short enough to be useful in loop() would reset us mid-setup.
+  Serial.println(F("Enabling watchdog timer..."));
   wdt_enable(WDT_TIMEOUT);
+
+  // Say we've booted
+  Serial.println(F("Boot complete. Running!"));
 }
 
 void loop() {
