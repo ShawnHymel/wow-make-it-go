@@ -2,7 +2,7 @@
 #include <SPI.h>
 #include <avr/wdt.h>
 
-// Custom
+// Custom libraries
 #include "SoftVCNL4040.h"
 #include "HardVCNL4040.h"
 #include "Serial7Seg.h"
@@ -10,16 +10,21 @@
 //*****************************************************************************
 // Settings
 
-const uint16_t TRIGGER_THRESHOLD = 300;   // proximity reading counted as "covered"
+const uint16_t TRIGGER_DELTA     = 500;   // how far above ambient = "covered"
+const uint8_t  AMBIENT_SAMPLES   = 10;    // readings to average during calibration
 const uint8_t  DISPLAY_SS_PIN    = 8;
 const uint8_t  DISPLAY_BRIGHTNESS = 255;
 
 // A run that never trips the finish line is abandoned here. The timer
 // freezes at the ceiling and the display returns to READY.
-const unsigned long RACE_TIMEOUT_MS = 99900UL;   // 99.9 s
+const unsigned long RACE_TIMEOUT_MS = 999900UL;   // 999.9 s
 
-// How fast the "GO" prompt blinks while the gate is primed.
-const unsigned long FLASH_INTERVAL_MS = 400UL;
+// Finish-line time flash: blink the result this many times before holding.
+const uint8_t      FINISH_FLASH_COUNT = 4;
+const unsigned long FINISH_FLASH_MS   = 300UL;
+
+// Consecutive read failures before a hard reboot.
+const uint8_t ERROR_REBOOT_LIMIT = 10;
 
 //*****************************************************************************
 // Globals
@@ -34,20 +39,27 @@ HardVCNL4040 prox2;         // hardware I2C on A4/A5    -- finish line
 // 7-segment LED display
 Serial7Seg display(DISPLAY_SS_PIN);
 
+// Proximity sensor ambient baselines (captured during setup)
+uint16_t ambient1 = 0;
+uint16_t ambient2 = 0;
+
+
 //*****************************************************************************
 // Timer state machine
 //
-//   READY   -- idle. Display holds 0.0 (boot) or the last race time until a
-//              new object is placed on the start gate.
-//   PRIMED  -- object resting on the gate. Flash "GO" until it is released.
-//   RUNNING -- object has left the gate; count up live. Stop on the finish
-//              line (sensor 2) or at the timeout ceiling.
-//   ERROR   -- a sensor read failed; show Err1/Err2 until it recovers.
+//   READY    -- idle. Display holds 0.0 (boot) or the last race time until a
+//               new object is placed on the start gate.
+//   PRIMED   -- object resting on the gate. Show steady "GO" until released.
+//   RUNNING  -- object has left the gate; count up live. Stop on the finish
+//               line (sensor 2) or at the timeout ceiling.
+//   FINISHED -- finish line tripped; flash the final time a few times, then
+//               hold it and return to READY.
+//   ERROR    -- a sensor read failed; show Err1/Err2 until it recovers.
 //
 // Nothing here blocks: every transition is driven by millis() and the
 // sensors' own edge/level state.
 
-enum State { READY, PRIMED, RUNNING, ERROR };
+enum State { READY, PRIMED, RUNNING, FINISHED, ERROR };
 
 //*****************************************************************************
 // Display helpers
@@ -101,6 +113,22 @@ void hardReboot() {
   while (1) { }
 }
 
+// Read N samples from each sensor and store the average as the ambient
+// baseline. Called once during setup after both sensors are initialised.
+void calibrateAmbient() {
+  uint32_t sum1 = 0, sum2 = 0;
+  for (uint8_t i = 0; i < AMBIENT_SAMPLES; i++) {
+    sum1 += prox1.readProximity();
+    sum2 += prox2.readProximity();
+    delay(50);
+  }
+  ambient1 = sum1 / AMBIENT_SAMPLES;
+  ambient2 = sum2 / AMBIENT_SAMPLES;
+
+  Serial.print(F("Ambient 1: ")); Serial.println(ambient1);
+  Serial.print(F("Ambient 2: ")); Serial.println(ambient2);
+}
+
 void reportTrigger(uint8_t lane, uint16_t reading) {
   Serial.print(F("TRIGGER lane "));
   Serial.print(lane);
@@ -129,7 +157,9 @@ void setup() {
   delay(1000);
   bool ok1 = prox1.begin();
   if (!ok1) {
-    Serial.println(F("Sensor 1 not found"));
+    Serial.println(F("Error: Sensor 1 not found"));
+    display.print("Err1");
+    delay(1000);
     hardReboot();
   }
 
@@ -137,10 +167,15 @@ void setup() {
   delay(1000);
   bool ok2 = prox2.begin();
   if (!ok2) {
-    Serial.println(F("Sensor 2 not found"));
+    Serial.println(F("Error: Sensor 2 not found"));
+    display.print("Err2");
+    delay(1000);
     hardReboot();
   }
   Serial.println(F("Both sensors armed"));
+
+  // Capture ambient proximity baselines before anything is on the track.
+  calibrateAmbient();
 
   // Timer starts at 0.0, waiting for an object on the gate.
   showTenths(0);
@@ -148,80 +183,136 @@ void setup() {
 
 void loop() {
   static State state = READY;
-  static unsigned long startTime  = 0;   // millis() when the gate released
-  static unsigned long flashClock = 0;   // last GO blink toggle
-  static bool          flashOn    = false;
+  static unsigned long startTime    = 0;   // millis() when the gate released
+  static unsigned long finishTenths = 0;   // cached finish time for flashing
+  static unsigned long flashClock   = 0;   // last finish blink toggle
+  static uint8_t       flashesLeft  = 0;   // remaining finish blinks
+  static bool          flashOn      = false;
   static bool          prevCovered1 = false;
 
   // Poll both sensors once per pass. checkTrigger() also refreshes each
   // sensor's ok()/covered() state.
-  bool rise1 = prox1.checkTrigger(TRIGGER_THRESHOLD);   // object arrived at gate
-  bool rise2 = prox2.checkTrigger(TRIGGER_THRESHOLD);   // object hit finish line
+  bool rise1 = prox1.checkTrigger(ambient1 + TRIGGER_DELTA);   // object arrived at gate
+  bool rise2 = prox2.checkTrigger(ambient2 + TRIGGER_DELTA);   // object hit finish line
 
-  // A bad read trumps everything: surface it and hold until it recovers.
-  if (!prox1.ok()) {
-    showText("Err1");
-    Serial.println("Error: sensor 1");
+  // A bad read trumps everything: show the error and skip the rest of
+  // loop() until the sensor recovers. Reboot after too many in a row.
+  static uint8_t errCount1 = 0;
+  static uint8_t errCount2 = 0;
+
+  bool fail1 = !prox1.ok();
+  bool fail2 = !prox2.ok();
+
+  // Error recovery for sensors: show error code and reboot if the error occurs
+  // too many times.
+  if (fail1 || fail2) {
+    if (fail1) {
+      errCount1++;
+      Serial.print(F("Error: sensor 1 ("));
+      Serial.print(errCount1);
+      Serial.println(')');
+    }
+    if (fail2) {
+      errCount2++;
+      Serial.print(F("Error: sensor 2 ("));
+      Serial.print(errCount2);
+      Serial.println(')');
+    }
+    // Show whichever sensor is failing (prefer Err1 if both)
+    showText(fail1 ? "Err1" : "Err2");
     state = ERROR;
+
+    if (errCount1 >= ERROR_REBOOT_LIMIT || errCount2 >= ERROR_REBOOT_LIMIT) {
+      Serial.println(F("Too many consecutive errors -- rebooting"));
+      hardReboot();
+    }
+    return;   // skip the rest of loop() until next pass
   }
-  if (!prox2.ok()) {
-    showText("Err2");
-    Serial.println("Error: sensor 2");
-    state = ERROR;
-  }
-  if (state == ERROR) {              // reads recovered -> clean slate at 0.0
+
+  // Both sensors read OK this pass.
+  if (state == ERROR) {
+    errCount1 = 0;
+    errCount2 = 0;
     state = READY;
     prevCovered1 = prox1.covered();  // resync so we don't fire a phantom edge
     showTenths(0);
   }
+  errCount1 = 0;
+  errCount2 = 0;
 
   // Falling edge on the start gate = the object was released.
   bool covered1 = prox1.covered();
   bool release1 = prevCovered1 && !covered1;
   prevCovered1 = covered1;
 
+  // A rising edge on the start gate always primes, regardless of state.
+  // This lets a runner re-stage mid-race without waiting for a timeout.
+  if (rise1 && state != PRIMED) {
+    reportTrigger(1, prox1.last());
+    Serial.println(F("PRIMED -- GO"));
+    state = PRIMED;
+    display.clear();
+    showText("-GO-");
+  }
+
   switch (state) {
 
     case READY:
-      // Display holds 0.0 or the previous result. Wait for the gate.
-      if (rise1) {
-        reportTrigger(1, prox1.last());
-        Serial.println(F("PRIMED -- GO"));
-        state = PRIMED;
-        flashClock = millis();
-        flashOn = true;
-        showText(" GO ");
-      }
-      break;
+      break;   // waiting for rise1, handled above
 
     case PRIMED:
       if (release1) {
         Serial.println(F("START"));
         state = RUNNING;
         startTime = millis();
+        display.clear();
         showTenths(0);
-      } else if (millis() - flashClock >= FLASH_INTERVAL_MS) {
-        flashClock = millis();
-        flashOn = !flashOn;
-        showText(flashOn ? " GO " : "    ");
       }
       break;
 
     case RUNNING: {
       unsigned long elapsed = millis() - startTime;
       bool timedOut = elapsed >= RACE_TIMEOUT_MS;
-      if (timedOut) elapsed = RACE_TIMEOUT_MS;   // clamp to the 99.9 s ceiling
+      if (timedOut) elapsed = RACE_TIMEOUT_MS;   // clamp to the ceiling
       showTenths(elapsed / 100);
 
-      if (rise2 || timedOut) {
-        if (rise2) reportTrigger(2, prox2.last());
-        Serial.print(timedOut ? F("TIMEOUT @ ") : F("FINISH @ "));
+      if (rise2) {
+        reportTrigger(2, prox2.last());
+        Serial.print(F("FINISH @ "));
         Serial.print(elapsed / 1000.0, 1);
         Serial.println(F(" s"));
-        state = READY;   // freeze: the final time stays on the display
+        finishTenths = elapsed / 100;
+        flashClock   = millis();
+        flashesLeft  = FINISH_FLASH_COUNT;
+        flashOn      = false;              // start with blank (first toggle shows time)
+        showText("    ");
+        state = FINISHED;
+      } else if (timedOut) {
+        Serial.print(F("TIMEOUT @ "));
+        Serial.print(elapsed / 1000.0, 1);
+        Serial.println(F(" s"));
+        state = READY;                     // hold steady, no flash
       }
       break;
     }
+
+    case FINISHED:
+      if (flashesLeft > 0) {
+        if (millis() - flashClock >= FINISH_FLASH_MS) {
+          flashClock = millis();
+          flashOn = !flashOn;
+          if (flashOn) {
+            showTenths(finishTenths);
+          } else {
+            showText("    ");
+            flashesLeft--;
+          }
+        }
+      } else {
+        showTenths(finishTenths);           // hold the final time
+        state = READY;
+      }
+      break;
 
     case ERROR:
       break;   // handled above; here to keep the compiler happy
