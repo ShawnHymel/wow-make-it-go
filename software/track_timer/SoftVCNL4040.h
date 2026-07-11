@@ -78,6 +78,13 @@ public:
   // the rising edge that checkTrigger() returns.
   bool covered() const { return _covered; }
 
+  // Force the debounce state back to "not covered" so the very next reading
+  // above threshold counts as a fresh rising edge -- even if the sensor is
+  // currently reading high. Used to clear a stale latch (e.g. re-arming the
+  // finish sensor at the start of a new race) that would otherwise swallow
+  // the next real crossing.
+  void rearm() { _covered = false; }
+
   // Rising-edge trigger with hysteresis. Reads the sensor once (updating
   // last()) and returns true exactly once each time proximity crosses
   // above `threshold`. It re-arms only after the reading falls back below

@@ -10,8 +10,13 @@
 //*****************************************************************************
 // Settings
 
+// Set to 1 to stream both sensors' raw readings over serial every loop pass.
+// Leave at 0 for normal operation.
+#define DEBUG 0
+
 const uint16_t TRIGGER_DELTA     = 500;   // how far above ambient = "covered"
 const uint8_t  AMBIENT_SAMPLES   = 10;    // readings to average during calibration
+
 const uint8_t  DISPLAY_SS_PIN    = 8;
 const uint8_t  DISPLAY_BRIGHTNESS = 255;
 
@@ -134,6 +139,26 @@ void calibrateAmbient() {
   Serial.print(F("Ambient 2: ")); Serial.println(ambient2);
 }
 
+// Re-baseline a sensor: average a short burst of readings and return it as
+// the new ambient level. Call this only when the sensor is known to be clear
+// (finish line at race start, start gate at race end). Unlike
+// calibrateAmbient() there is NO inter-sample delay -- the burst is ~1 ms, so
+// it is safe to call mid-race without blocking finish detection or the clock.
+template <typename T>
+uint16_t burstAmbient(T &sensor) {
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < AMBIENT_SAMPLES; i++) sum += sensor.readProximity();
+  return sum / AMBIENT_SAMPLES;
+}
+
+// Re-baseline the start gate at the end of a race, when the car has left the
+// gate and it should be reading clear. Skipped if something is already on the
+// gate (a runner re-staging the instant the race ends), so an object is never
+// captured as the baseline -- the previous good baseline just stands.
+void rebaselineStartGate() {
+  if (!prox1.covered()) ambient1 = burstAmbient(prox1);
+}
+
 void reportTrigger(uint8_t lane, uint16_t reading) {
   Serial.print(F("TRIGGER lane "));
   Serial.print(lane);
@@ -226,6 +251,16 @@ void loop() {
   bool rise1 = prox1.checkTrigger(ambient1 + TRIGGER_DELTA);   // object arrived at gate
   bool rise2 = prox2.checkTrigger(ambient2 + TRIGGER_DELTA);   // object hit finish line
 
+#if DEBUG
+  // Raw readings from this pass (last() is the value checkTrigger just read;
+  // 65535 = read error). Printed before the error branch so failing reads
+  // still show up.
+  Serial.print(F("prox1: "));
+  Serial.print(prox1.last());
+  Serial.print(F("\tprox2: "));
+  Serial.println(prox2.last());
+#endif
+
   // A bad read trumps everything: show the error and skip the rest of
   // loop() until the sensor recovers. Reboot after too many in a row.
   static uint8_t errCount1 = 0;
@@ -296,6 +331,15 @@ void loop() {
         Serial.println(F("START"));
         state = RUNNING;
         startTime = millis();
+        // The finish line is guaranteed clear right now (the car is still at
+        // the gate), so re-capture its baseline and re-arm. This corrects a
+        // baseline that drifted too far below the resting level to self-heal
+        // -- otherwise the first crossing either never registers (stale latch)
+        // or fires instantly (resting sits above threshold) -- and guarantees
+        // a fresh rising edge for the first real crossing of this run.
+        //
+        ambient2 = burstAmbient(prox2);
+        prox2.rearm();
         display.clear();
         showTenths(0);
       }
@@ -322,6 +366,7 @@ void loop() {
         Serial.print(F("TIMEOUT @ "));
         Serial.print(elapsed / 1000.0, 1);
         Serial.println(F(" s"));
+        rebaselineStartGate();             // race over, gate clear -- refresh
         state = READY;                     // hold steady, no flash
       }
       break;
@@ -341,6 +386,7 @@ void loop() {
         }
       } else {
         showTenths(finishTenths);           // hold the final time
+        rebaselineStartGate();              // race over, gate clear -- refresh
         state = READY;
       }
       break;
